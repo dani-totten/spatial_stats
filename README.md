@@ -10,6 +10,7 @@
 The expected number of overdose deaths for each county were modeled in two ways
 1) Constant Risk Hypothesis - Assumes all individiduals have teh same risk of overdose regardless of location. This is scaled only for population, no other factors are considered,
 2) Poisson GLM - Expected number of deaths account for factors correlated with deaths from drug overdose. Variables were chosen based on research conducted by the CDC and include only statistically significant variables. Population weighting was also included in the model.
+
 ![](https://github.com/dani-totten/spatial_stats/blob/main/poisson_vars.png)
 
 Residual differences between observed and expected counts of overdose deaths by county are larger for the constant risk hypothesis
