@@ -6,6 +6,8 @@
 - Clusters identified with poisson spatial scan
 - South-Central Colorado has a cluster of excess opioid overdose deaths
 
+![](https://github.com/dani-totten/spatial_stats/blob/main/od_death_rate_scaled.png)
+
 # Hypotheses
 The expected number of overdose deaths for each county were modeled in two ways
 1) Constant Risk Hypothesis - Assumes all individiduals have teh same risk of overdose regardless of location. This is scaled only for population, no other factors are considered,
@@ -21,4 +23,5 @@ Moran's-I test used to detect global autocorrelation, ie; whether or not autocor
 
 # Identifying clusters
 After identifying the presence of autocorrelation, I used a few methods to identify clusters. Null hypotheses varied slightly, but all tests were in agreement that a cluster of excess overdose deaths was present in south-central Colorado
+
 ![](https://github.com/dani-totten/spatial_stats/blob/main/Screen%20Shot%202020-10-26%20at%2011.15.56%20AM.png)
