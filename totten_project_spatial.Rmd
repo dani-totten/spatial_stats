@@ -1,0 +1,332 @@
+
+library(tidyverse)
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(maps)
+library(rgeos)
+library(lwgeom)
+library(smerc)
+library(car)
+library(spdep)
+library(RColorBrewer)
+library(gridExtra)
+
+od_deaths <- read_csv("CO_counties.csv", na = "NA")
+co <- data.frame(read_csv("countydat2.csv"))
+co_countyest <- read_csv("co_countyest.csv")
+
+estpop <- data.frame(co_countyest[2:65,])
+estpop$county <- str_remove(estpop$Area, "COUNTY")
+estpop$county <- str_trim(estpop$county)
+estpop$county <- str_to_title(estpop$county)
+estpop <- estpop %>% select(county, July.2014, July.2018)
+
+codat <- full_join(od_deaths, co)
+codat <- full_join(codat, estpop)
+
+codat$odrate <- (codat$all/codat$July.2018)*10000
+codat$oprate <- (codat$opioid/codat$July.2018)*10000
+
+# put into alphabetical order
+codat <- codat %>% arrange(county)
+
+# change NAs to 1
+codat$all[is.na(codat$all)] <- 1
+codat$opioid[is.na(codat$opioid)] <- 1
+
+# also add in rownames for joining to clusters later
+codat$rowid <- as.numeric(rownames(codat))
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+states <- st_as_sf(map("state", plot = FALSE, fill = TRUE))
+counties <- st_as_sf(map("county", plot = FALSE, fill = TRUE))
+counties <- subset(counties, grepl("colorado,", counties$ID))
+counties$area <- as.numeric(st_area(counties))
+
+# make into spdf
+counties$ID <- str_remove(counties$ID, "colorado,")
+counties$ID <- str_to_title(counties$ID)
+counties <- rename(counties, "county" = "ID")
+
+cosf <- full_join(counties, codat)
+library(geosphere)
+cosf$centroids <- centroid(as_Spatial(cosf$geometry))
+cosf$easting <- cosf$centroids[,1]
+cosf$northing <- cosf$centroids[,2]
+cosf <-data.frame(select(cosf, -centroids))
+
+# convert to spatial points data frame
+cosf[is.na(cosf)] <- 0
+coordinates(cosf) = c("easting", "northing")
+
+# create a dataset to model off of, remove redundant vars
+model_all <- codat %>%
+  mutate(growth = (July.2018-July.2014)/July.2014) %>% select(-county, -opioid, - July.2014, -pop2010, -odrate, -oprate, -rowid)
+
+alldeaths <- glm(all ~ . - July.2018, data = model_all, family = "poisson", offset = log(July.2018))
+summary(alldeaths)
+# drop non sig variables
+
+alldeaths1 <- glm(all ~ female + age_under_18 + white_not_hispanic+ no_move_in_one_plus_year + bachelors + home_ownership + poverty + growth, data = model_all, family = "poisson", offset = log(July.2018))
+summary(alldeaths1)
+vif(alldeaths1)
+plot(alldeaths1)
+
+# change NAs to 2 from 1
+model_all2 <- model_all
+model_all2$all <- ifelse(model_all2$all == 1, 2, model_all2$all)
+alldeaths3 <- glm(all ~ . - July.2018, data = model_all2, family = "poisson", offset = log(July.2018))
+summary(alldeaths3)
+
+alldeaths4 <- glm(all ~ female + age_under_18 + white_not_hispanic+ no_move_in_one_plus_year + bachelors + home_ownership + poverty + growth, data = model_all2, family = "poisson", offset = log(July.2018))
+summary(alldeaths4)
+summary(alldeaths1$fitted.values - alldeaths4$fitted.values)
+
+# use first with NAs = 1
+cosf$exp_od <- alldeaths1$fitted.values
+
+od_deaths = cosf$all
+regions = length(od_deaths)
+co_pop = cosf$July.2018
+exp_rni = sum(od_deaths)/sum(co_pop)*co_pop
+exp_pois = cosf$exp_od
+
+# how far off rni, pois is
+summ_diff <- data.frame(cosf) %>% 
+  transmute(county, all, round(exp_rni,1), rni_diff = round((all - exp_rni),1), round(exp_pois,1), pois_diff = round((all - exp_pois),1)) %>%
+  arrange(-all)
+
+# CEPP with expected counts under CRH
+cepp6k_rni <- cepp.test(coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_rni,
+                   nstar = 6000,
+                   alpha = 0.01)
+
+summary(cepp6k_rni)
+cosf$cepp6k_rni <- 
+  ifelse(cosf$rowid %in% (cepp6k_rni$clusters[[1]]$locids), 1,
+       ifelse(cosf$rowid %in% (cepp6k_rni$clusters[[2]]$locids), 2, NA))
+
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill= as.factor(cosf$cepp6k_rni))) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_brewer(palette = "Set2", name = "Cluster") +
+  ggtitle("CEPP, CRH, n* = 6000 at-risk")
+ggsave("cepp_6krni.png")
+
+# CEPP with expected counts as Poisson
+cepp6k_p <- cepp.test(coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_pois,
+                   nstar = 6000,
+                   alpha = 0.01)
+
+summary(cepp6k_p)
+cosf$cepp6k_p <- ifelse(cosf$rowid %in% (cepp6k_p$clusters[[1]]$locids), 1, NA)
+
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill= as.factor(cosf$cepp6k_p))) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_brewer(palette = "Set2", name = "Cluster") +
+  ggtitle("CEPP, Poisson GLM, n* = 6000 at-risk")
+ggsave("cepp_6kp.png")
+
+
+cepp15k_rni <- cepp.test(coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_rni,
+                   nstar = 15000,
+                   alpha = 0.01)
+summary(cepp15k_rni)
+cosf$cepp15k_rni <- 
+  ifelse(cosf$rowid %in% (cepp15k_rni$clusters[[1]]$locids), 1,
+       ifelse(cosf$rowid %in% (cepp15k_rni$clusters[[2]]$locids), 2, NA))
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill= as.factor(cosf$cepp15k_rni))) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_brewer(palette = "Set2", name = "Cluster") +
+  ggtitle("CEPP, CRH GLM, n* = 15000 at-risk")
+ggsave("cepp_15krni.png")
+
+cepp15k_p <- cepp.test(coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_pois,
+                   nstar = 15000,
+                   alpha = 0.01)
+summary(cepp15k_p)
+cosf$cepp15k_p <- ifelse(cosf$rowid %in% (cepp15k_p$clusters[[1]]$locids), 1, NA)
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill= as.factor(cosf$cepp15k_p))) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_brewer(palette = "Set2", name = "Cluster") +
+  ggtitle("CEPP, Poisson GLM, n* = 15000 at-risk")
+ggsave("cepp_15kp.png")
+
+# no significant cluster
+cepp44k_rni <- cepp.test(coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_rni,
+                   nstar = 44000,
+                   alpha = 0.01)
+# no sig cluster
+cepp44k_p <- cepp.test(coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_pois,
+                   nstar = 44000,
+                   alpha = 0.01)
+
+
+
+#Poisson Spatial Scan
+scan_pois.1 <- scan.test(coords = coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_pois, 
+                   alpha = 0.1, 
+                   ubpop = 0.1)
+summary(scan_pois.1)
+cosf$scan_pois.1 <- ifelse(cosf$rowid %in% (scan_pois.1$clusters[[1]]$locids), 1, NA)
+
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill= as.factor(cosf$scan_pois.1))) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_brewer(palette = "Dark2", name = "Cluster") +
+  ggtitle("Poisson Spatial Scan, Poisson GLM, Upper Bound = 0.1")
+ggsave("pois1.png")
+
+scan_rni.1 <- scan.test(coords = coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_rni, 
+                   alpha = 0.1, 
+                   ubpop = 0.1)
+summary(scan_rni.1)
+cosf$scan_rni.1  <- 
+ifelse(cosf$rowid %in% (scan_rni.1$clusters[[1]]$locids), 1,
+       ifelse(cosf$rowid %in% (scan_rni.1$clusters[[2]]$locids), 2, NA))
+
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill= as.factor(cosf$scan_rni.1))) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_brewer(palette = "Dark2", name = "Cluster") +
+  ggtitle("Poisson Spatial Scan, CRH, Upper Bound = 0.1")
+ggsave("rni1.png")
+
+# population upper bound of 25% of population
+scan_pois.25 <- scan.test(coords = coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_pois, 
+                   alpha = 0.1, 
+                   ubpop = 0.25)
+summary(scan_pois.25)
+cosf$scan_pois.25 <- ifelse(cosf$rowid %in% (scan_pois.25$clusters[[1]]$locids), 1, NA)
+
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill= as.factor(cosf$scan_pois.25))) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_brewer(palette = "Dark2", name = "Cluster") +
+  ggtitle("Poisson Spatial Scan, Poisson GLM, Upper Bound = 0.25")
+ggsave("pois.25.png")
+
+scan_rni.25 <- scan.test(coords = coordinates(cosf),
+                   pop = co_pop,
+                   cases = od_deaths,
+                   ex = exp_rni, 
+                   alpha = 0.1, 
+                   ubpop = 0.25)
+summary(scan_rni.25)
+
+cosf$scan_rni.25  <- 
+ifelse(cosf$rowid %in% (scan_rni.25$clusters[[1]]$locids), 1,
+       ifelse(cosf$rowid %in% (scan_rni.25$clusters[[2]]$locids), 2,
+              ifelse(cosf$rowid %in% (scan_rni.25$clusters[[3]]$locids), 3,
+                     NA)))
+
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill= as.factor(cosf$scan_rni.25))) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_brewer(palette = "Dark2", name = "Cluster") +
+  ggtitle("Poisson Spatial Scan, CRH, Upper Bound = 0.25")
+ggsave("rni.25.png")
+
+
+#Moran's I
+# define spatial weights
+# create polynb matrix, need to cast geometry to polygon
+co_poly <- poly2nb(st_cast(cosf$geometry, "POLYGON"))
+#binary weights
+co_nb <- nb2listw(co_poly, style = "B")
+
+# moran's I CR function
+i_cr <- function(cases, exp, nb){
+  y_std = matrix((cases - exp)/sqrt(exp))
+  return(sum(nb * y_std %*% t(y_std))/sum(nb))
+}
+
+# CR version of Moran's I with expected counts poisson
+obs_stat <- i_cr(od_deaths, exp_pois, nb2mat(co_nb$neighbours))
+tsimc  <- numeric(500)
+for (i in 1:500)
+  tsimc[i] = i_cr(rpois(regions, exp_pois), exp = exp_pois, nb = nb2mat(co_nb$neighbours))
+(sum(tsimc >= obs_stat) + 1)/501
+
+# repeat for CRH
+obs_stat2 <- i_cr(od_deaths, exp_rni, nb2mat(co_nb$neighbours))
+tsimc2  <- numeric(500)
+for (i in 1:500)
+  tsimc2[i] = i_cr(rpois(regions, exp_rni), exp = exp_rni, nb = nb2mat(co_nb$neighbours))
+(sum(tsimc2 >= obs_stat2) + 1)/501
+
+
+# overdose deaths rates
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill = codat$odrate)) + 
+  geom_text(data = data.frame(cosf), aes(x=easting, y = northing, label = county), size = 1.5) +
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_continuous(low = "white", high = "red", name = "Deaths per 10,000") +
+  ggtitle("Overdose deaths per 10,000 residents, 2014-2018") 
+ggsave("od_deathrate_map.png")
+
+# opioid death rates
+ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill = codat$oprate)) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_continuous(low = "white", high = "red", name = "Deaths per 10,000") +
+  ggtitle("Opioid Overdose Deaths per 10,000 residents, 2014-2018") 
+ggsave("opiate_deathrate_map.png")
+
+p1 <- ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill = cosf$all - cosf$exp_od)) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_continuous(low = "white", high = "blue", name = "Difference") +
+  ggtitle("Obs. - Exp. under Poisson GLM") 
+
+p2 <- ggplot(data = world) +
+  geom_sf(data = states, fill = NA) +
+  geom_sf(data = counties, color = gray(.5), aes(fill = cosf$all - exp_rni)) + 
+  coord_sf(xlim = c(-110, -101), ylim = c(36.5, 41.5), expand = FALSE) +
+  scale_fill_continuous(low = "white", high = "blue", name = "Difference") +
+  ggtitle("Obs. - Exp. under CRH") 
+grid.arrange(p1, p2, ncol = 2)
+ggsave("sidebyside.png", grid.arrange(p2, p1, ncol = 2))
